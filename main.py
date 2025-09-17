@@ -90,7 +90,7 @@ try:
     from google.api_core import exceptions
     genai.configure(api_key=GEMINI_API_KEY)
 
-    system_instruction = """You are a Telegram bot offering study group help.
+    system_instruction = r"""You are a Telegram bot offering study group help.
 - Always use Telegram MarkdownV2 formatting.
 - Keep replies short, structured, and engaging.
 - Use bullet points, examples, and emojis.
