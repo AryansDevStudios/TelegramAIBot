@@ -7,12 +7,10 @@ from collections import deque
 from dotenv import load_dotenv
 import threading
 import time
-# FIXED: Added imports for login functionality
 from flask import Flask, render_template_string, Response, jsonify, send_from_directory, send_file, request, redirect, url_for, session
 from functools import wraps
 import zipfile
 import io
-# NEW: Added import for making web requests
 import requests
 
 # -----------------------------
@@ -21,14 +19,11 @@ import requests
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# NEW: Load password and URL from environment variables
 FLASK_PASSWORD = os.getenv("FLASK_PASSWORD")
 WEB_REQUEST_URL = os.getenv("WEB_REQUEST_URL")
 
+MODEL_NAME = "gemini-1.5-flash" # Changed to a more recent model, but you can use your preferred one
 
-MODEL_NAME = "gemini-2.5-flash-lite"
-
-# MODIFIED: Added check for the new FLASK_PASSWORD variable
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY or not FLASK_PASSWORD:
     print("FATAL ERROR: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, and FLASK_PASSWORD must be set in the .env file.")
     exit()
@@ -55,18 +50,16 @@ root_logger.addHandler(console_handler)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
-logging.getLogger("requests").setLevel(logging.WARNING) # NEW: Quieter logs for the requests library
+logging.getLogger("requests").setLevel(logging.WARNING)
 
-# NEW: Separate logger for web requests
 web_request_logger = logging.getLogger('WebRequestLogger')
 web_request_logger.setLevel(logging.INFO)
-web_request_logger.propagate = False # Prevent web logs from appearing in the main console.log
+web_request_logger.propagate = False
 web_request_handler = RotatingFileHandler(
     os.path.join(LOGS_DIR, "webrequests.log"), maxBytes=1*1024*1024, backupCount=3, encoding="utf-8"
 )
 web_request_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 web_request_logger.addHandler(web_request_handler)
-# --- End of new logger setup
 
 user_loggers = {}
 
@@ -97,12 +90,29 @@ try:
     from google.api_core import exceptions
     genai.configure(api_key=GEMINI_API_KEY)
 
-    system_instruction = """You are a telegram bot offering study group help.
-- Always format messages using Telegram MarkdownV2.
+    system_instruction = """You are a Telegram bot offering study group help.
+- Always use Telegram MarkdownV2 formatting.
 - Keep replies short, structured, and engaging.
 - Use bullet points, examples, and emojis.
 - One or two lines unless a longer answer is explicitly needed.
-- Do not use LaTeX or unsupported markup, only MarkdownV2.
+- Never use LaTeX or unsupported markup.
+- Escape reserved characters when needed to avoid formatting errors.
+
+📖 Telegram MarkdownV2 Formatting Guide:
+1. *Bold* → `*bold*`
+2. _Italic_ → `_italic_`
+3. __Underline__ → `__underline__`
+4. ~Strikethrough~ → `~strikethrough~`
+5. ||Spoiler|| → `||hidden text||`
+6. `Inline code` → `` `code` ``
+7. Multiline code block → ```\ncode here\n```
+8. [Inline link](https://example.com) → `[text](https://example.com)`
+9. Mention user → `[Name](tg://user?id=USER_ID)`
+10. Escape reserved characters with `\` before these: 
+   `_ * [ ] ( ) ~ ` > # + - = | { } . !`
+
+⚡ Example:
+"Hello *world*\! Visit [Google](https://google.com) for more info\."
 """
 
     gemini_model = genai.GenerativeModel(
@@ -155,7 +165,7 @@ def generate_gemini_answer(prompt: str) -> str:
 async def generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     answer = await asyncio.to_thread(generate_gemini_answer, prompt)
-    await update.message.reply_text(answer)
+    await update.message.reply_text(answer, parse_mode="MarkdownV2")
     user_logger = get_user_logger(update.message.chat.id, update.message.from_user.full_name)
     user_logger.info(f"BOT: {' '.join(answer.splitlines())}")
 
@@ -293,7 +303,7 @@ flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24) 
 HOME_DIR = os.getcwd()
 
-# --- NEW: Web Request Function ---
+# --- Web Request Function ---
 def send_keep_alive_request():
     """Sends a GET request to the specified URL and logs the result separately."""
     if not WEB_REQUEST_URL:
@@ -308,7 +318,7 @@ def send_keep_alive_request():
     except requests.exceptions.RequestException as e:
         web_request_logger.error(f"Failed to send request to {WEB_REQUEST_URL}. Error: {e}")
 
-# --- NEW: Login Template ---
+# --- Login Template ---
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -359,7 +369,7 @@ HTML_TEMPLATE = """
         h1 { margin-top: 0; }
         button { background-color: #333; color: #fff; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; transition: background-color 0.2s; margin-bottom: 15px; }
         button:hover { background-color: #555; }
-        .logout-btn { background-color: #cf6679; margin-top: auto; } /* Style for logout */
+        .logout-btn { background-color: #cf6679; margin-top: auto; }
         .logout-btn:hover { background-color: #b05260; }
         ul { list-style: none; padding: 0; }
         li { margin: 5px 0; }
@@ -414,8 +424,8 @@ HTML_TEMPLATE = """
         function loadFiles(path = '') {
             fetch(`/files?path=${encodeURIComponent(path)}`)
                 .then(response => {
-                    if (response.redirected) {
-                        window.location.href = response.url;
+                    if (response.status === 401) {
+                        window.location.href = '/login';
                         return;
                     }
                     return response.json();
@@ -439,20 +449,22 @@ HTML_TEMPLATE = """
                         link.href = '#';
                         link.className = 'dir';
                         link.textContent = dir + '/';
-                        link.onclick = (e) => { e.preventDefault(); loadFiles(data.path + '/' + dir); };
+                        link.onclick = (e) => { e.preventDefault(); loadFiles((path ? path + '/' : '') + dir); };
                         li.appendChild(link);
                         fileList.appendChild(li);
                     });
                     data.files.forEach(file => {
                         const li = document.createElement('li');
+                        const fullPath = (path ? path + '/' : '') + file;
+                        
                         const viewLink = document.createElement('a');
                         viewLink.href = '#';
                         viewLink.className = 'file';
                         viewLink.textContent = file;
-                        viewLink.onclick = (e) => { e.preventDefault(); viewFile(data.path + '/' + file); };
+                        viewLink.onclick = (e) => { e.preventDefault(); viewFile(fullPath); };
                         
                         const downloadLink = document.createElement('a');
-                        downloadLink.href = `/download${data.path}/${file}`;
+                        downloadLink.href = `/download/${fullPath}`;
                         downloadLink.textContent = ' (download)';
                         downloadLink.style.fontSize = '0.8em';
 
@@ -475,16 +487,20 @@ HTML_TEMPLATE = """
                 fileEventSource.close();
             }
 
-            fileEventSource = new EventSource(`/view${filePath}`);
+            fileEventSource = new EventSource(`/view/${filePath}`);
             let fullContent = '';
             fileEventSource.onmessage = function(event) {
                 if (event.data === '___EOF___') {
                     fileEventSource.close();
                     return;
                 }
-                fullContent += event.data + '\\n';
+                fullContent += event.data + '\\n'; // Use a real newline
                 content.textContent = fullContent;
             };
+            fileEventSource.onerror = function() {
+                content.textContent = 'Error loading file. It may be binary or unreadable.';
+                fileEventSource.close();
+            }
         }
 
         function closeFileViewer() {
@@ -500,13 +516,13 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- NEW: Login required decorator ---
+# --- Login required decorator ---
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not session.get('logged_in'):
-            if request.path.startswith('/files') or request.path.startswith('/log_stream'):
-                return redirect(url_for('login'))
+            if request.path.startswith('/files') or request.path.startswith('/log_stream') or request.path.startswith('/view'):
+                 return jsonify({"error": "Not authenticated"}), 401
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
@@ -516,11 +532,11 @@ def login_required(f):
 def login():
     error = None
     if request.method == 'POST':
-        # MODIFIED: Use password from environment variable
         if request.form.get('password') == FLASK_PASSWORD:
             session['logged_in'] = True
             root_logger.info("Successful login to web panel.")
-            return redirect(url_for('index'))
+            next_url = request.args.get('next')
+            return redirect(next_url or url_for('index'))
         else:
             error = 'Invalid password. Please try again.'
             root_logger.warning("Failed login attempt to web panel.")
@@ -534,7 +550,6 @@ def logout():
 @flask_app.route('/')
 @login_required
 def index():
-    # NEW: Send the keep-alive request in a non-blocking thread when the page is loaded
     threading.Thread(target=send_keep_alive_request).start()
     return render_template_string(HTML_TEMPLATE, home_dir=HOME_DIR)
 
@@ -549,16 +564,16 @@ def log_stream():
             with open(log_file_path, 'r', encoding='utf-8') as f:
                 initial_lines = deque(f, maxlen=INITIAL_LOG_LINES)
                 for line in initial_lines:
-                    yield f"data: {line.strip()}\n\n"
+                    yield f"data: {line.strip()}\\n\\n"
                 
                 while True:
                     line = f.readline()
                     if not line:
                         time.sleep(0.1)
                         continue
-                    yield f"data: {line.strip()}\n\n"
+                    yield f"data: {line.strip()}\\n\\n"
         except FileNotFoundError:
-             yield f"data: ERROR: Log file not found at {log_file_path}\n\n"
+             yield f"data: ERROR: Log file not found at {log_file_path}\\n\\n"
 
     return Response(generate(), mimetype='text/event-stream')
     
@@ -585,7 +600,7 @@ def list_files():
         
     return jsonify({"path": req_path, "dirs": sorted(dirs), "files": sorted(files)})
 
-@flask_app.route('/view<path:filepath>')
+@flask_app.route('/view/<path:filepath>')
 @login_required
 def view_file(filepath):
     abs_path = os.path.join(HOME_DIR, filepath.strip('/'))
@@ -600,25 +615,41 @@ def view_file(filepath):
                     if not line:
                         yield 'data: ___EOF___\n\n'
                         break
-                    yield f'data: {line.rstrip()}\\n\\n'
+                    yield f'data: {line.rstrip()}\n\n'
         except Exception as e:
-            yield f'data: Error reading file: {str(e)}\\n\\n'
+            yield f'data: Error reading file: {str(e)}\n\n'
             yield 'data: ___EOF___\n\n'
 
     return Response(generate(), mimetype='text/event-stream')
 
-@flask_app.route('/download<path:filepath>')
+@flask_app.route('/download/<path:filepath>')
 @login_required
 def download_file(filepath):
-    return send_from_directory(HOME_DIR, filepath, as_attachment=True)
+    safe_full_path = os.path.abspath(os.path.join(HOME_DIR, filepath))
+    
+    if not safe_full_path.startswith(os.path.abspath(HOME_DIR)):
+        return "Access Denied: You cannot access files outside the home directory.", 403
+        
+    try:
+        directory = os.path.dirname(safe_full_path)
+        filename = os.path.basename(safe_full_path)
+        return send_from_directory(directory, filename, as_attachment=True)
+    except FileNotFoundError:
+        return "File not found.", 404
+    except Exception as e:
+        root_logger.error(f"Error during file download: {e}", exc_info=True)
+        return "An error occurred while trying to download the file.", 500
     
 @flask_app.route('/download_zip')
 @login_required
 def download_zip():
     memory_file = io.BytesIO()
+    excluded_files = ['.env']
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, _, files in os.walk(HOME_DIR):
             for file in files:
+                if file in excluded_files:
+                    continue
                 file_path = os.path.join(root, file)
                 arcname = os.path.relpath(file_path, HOME_DIR)
                 zf.write(file_path, arcname)
@@ -627,9 +658,9 @@ def download_zip():
 
 def run_flask():
     root_logger.info("Starting Flask web server...")
-    # MODIFIED: It's generally better practice not to use the reloader in production-like scripts.
-    # It can cause the script to run twice. Let's run it directly.
-    flask_app.run(host='0.0.0.0', port=80, use_reloader=False)
+    # NOTE FOR LINUX: Ports below 1024 require root privileges.
+    # Using a port like 8080 is recommended to avoid running the script as root.
+    flask_app.run(host='0.0.0.0', port=8080, use_reloader=False)
 
 
 # ==============================================================================
