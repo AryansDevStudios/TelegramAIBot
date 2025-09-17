@@ -5,13 +5,11 @@ import logging
 from logging.handlers import RotatingFileHandler
 from collections import deque
 from dotenv import load_dotenv
-
-import google.generativeai as genai
-from google.api_core import exceptions
-
-from telegram import Update
-from telegram.constants import ChatAction, ChatType
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import threading
+import time
+from flask import Flask, render_template_string, Response, jsonify, send_from_directory, send_file
+import zipfile
+import io
 
 # -----------------------------
 # Load Environment Variables & Configuration
@@ -20,7 +18,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MODEL_NAME = "gemini-2.5-flash-lite" # Changed to a generally available model
+MODEL_NAME = "gemini-1.5-flash"  # Changed to a generally available model
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     print("FATAL ERROR: TELEGRAM_BOT_TOKEN and GEMINI_API_KEY must be set in the .env file.")
@@ -47,6 +45,7 @@ root_logger.addHandler(console_handler)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING) # Quieten Flask's default logger
 user_loggers = {}
 
 def sanitize_filename(name: str) -> str:
@@ -72,8 +71,10 @@ def get_user_logger(chat_id: int, full_name: str) -> logging.Logger:
 # Gemini Client
 # -----------------------------
 try:
+    import google.generativeai as genai
+    from google.api_core import exceptions
     genai.configure(api_key=GEMINI_API_KEY)
-    
+
     system_instruction = """You are a telegram bot offering study group help.
 - Always format messages using Telegram MarkdownV2.
 - Keep replies short, structured, and engaging.
@@ -81,7 +82,7 @@ try:
 - One or two lines unless a longer answer is explicitly needed.
 - Do not use LaTeX or unsupported markup, only MarkdownV2.
 """
-    
+
     gemini_model = genai.GenerativeModel(
         MODEL_NAME,
         system_instruction=system_instruction
@@ -93,31 +94,33 @@ except Exception as e:
     exit()
 
 # -----------------------------
+# Telegram Bot Imports
+# -----------------------------
+from telegram import Update
+from telegram.constants import ChatAction, ChatType
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+# -----------------------------
 # Bot State Management
 # -----------------------------
-# { chat_id: boolean }
-# False (default): Reply to all messages.
-# True: Reply only on mention or reply to bot's message.
 chat_reply_modes = {}
-
 
 # -----------------------------
 # Gemini & Telegram Interaction Helpers
 # -----------------------------
 def generate_gemini_answer(prompt: str) -> str:
     history.append({'role': 'user', 'parts': [prompt]})
-    
     try:
         chat_session = gemini_model.start_chat(history=list(history))
         response = chat_session.send_message(prompt)
         full_response_text = response.text
-        
+
         if full_response_text.strip():
             history.append({'role': 'model', 'parts': [full_response_text]})
-        
+
         if len(history) > 10:
-             history.popleft()
-             history.popleft()
+            history.popleft()
+            history.popleft()
         return full_response_text
 
     except exceptions.GoogleAPICallError as e:
@@ -129,11 +132,8 @@ def generate_gemini_answer(prompt: str) -> str:
 
 async def generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
     answer = await asyncio.to_thread(generate_gemini_answer, prompt)
-    
     await update.message.reply_text(answer)
-    
     user_logger = get_user_logger(update.message.chat.id, update.message.from_user.full_name)
     user_logger.info(f"BOT: {' '.join(answer.splitlines())}")
 
@@ -157,30 +157,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @log_user_message
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    
-    # In private chats, always reply.
     if chat.type == ChatType.PRIVATE:
         await generate_and_reply(update, context, update.message.text)
         return
 
-    # In group chats, check the reply mode.
-    # Default to False (reply to everything) if not set.
     mention_only_mode = chat_reply_modes.get(chat.id, False)
-
     if mention_only_mode:
         message = update.message
         bot_username = f"@{context.bot.username}"
-        
         is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id
         bot_is_mentioned = bot_username in (message.text or "")
-
         if is_reply_to_bot or bot_is_mentioned:
             prompt = message.text.replace(bot_username, "").strip()
             await generate_and_reply(update, context, prompt)
     else:
-        # If mode is False, reply to all messages.
         await generate_and_reply(update, context, update.message.text)
-
 
 @log_user_message
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,17 +181,13 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await generate_and_reply(update, context, question)
 
+# ... (other bot command handlers: set_reply_mode, tip, example, etc.) ...
 @log_user_message
 async def set_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-
-    # This command is not applicable in private chats.
     if chat.type == ChatType.PRIVATE:
         await update.message.reply_text("This command is only for group chats.")
         return
-
-    # ADMIN CHECK IS REMOVED - ANY USER CAN RUN THIS COMMAND
-
     if not context.args:
         current_mode = "mention/reply" if chat_reply_modes.get(chat.id, False) else "all messages"
         await update.message.reply_text(
@@ -209,7 +196,6 @@ async def set_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='MarkdownV2'
         )
         return
-
     new_mode_str = context.args[0].lower()
     if new_mode_str in ["true", "on", "yes"]:
         chat_reply_modes[chat.id] = True
@@ -219,7 +205,6 @@ async def set_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📢 Bot will now reply to all messages in the group.")
     else:
         await update.message.reply_text("Invalid option. Please use `true` or `false`.")
-
 
 @log_user_message
 async def tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,10 +251,9 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------
 # Main Bot Setup
 # -----------------------------
-def main():
+def run_bot():
     root_logger.info("Starting bot...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     command_handlers = {
         "start": start, "help": help_command, "about": about, "ask": ask,
         "tip": tip, "example": example, "quiz": quiz, "funfact": funfact,
@@ -277,14 +261,256 @@ def main():
     }
     for command, handler in command_handlers.items():
         app.add_handler(CommandHandler(command, handler))
-    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     root_logger.info("Bot is running and polling for updates.")
     app.run_polling()
 
+# ==============================================================================
+# FLASK WEBSERVER
+# ==============================================================================
+flask_app = Flask(__name__)
+HOME_DIR = "/home/AryanIssPro/"
+
+# --- HTML & JS TEMPLATE ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Control Panel</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #121212; color: #e0e0e0; display: flex; height: 100vh; }
+        .sidebar { width: 300px; background-color: #1e1e1e; padding: 20px; border-right: 1px solid #333; overflow-y: auto; }
+        .main-content { flex-grow: 1; display: flex; flex-direction: column; }
+        .log-container { flex-grow: 1; background-color: #181818; padding: 20px; overflow-y: auto; font-family: 'Courier New', Courier, monospace; font-size: 14px; white-space: pre-wrap; }
+        .top-bar { padding: 10px 20px; background-color: #1e1e1e; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+        h1, h2 { color: #ffffff; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        h1 { margin-top: 0; }
+        button { background-color: #333; color: #fff; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; transition: background-color 0.2s; }
+        button:hover { background-color: #555; }
+        ul { list-style: none; padding: 0; }
+        li { margin: 5px 0; }
+        a { color: #bb86fc; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .file { color: #90caf9; }
+        .dir { color: #a5d6a7; font-weight: bold; }
+        .file-viewer { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; }
+        .file-viewer-content { background: #1e1e1e; color: #e0e0e0; width: 80%; height: 80%; padding: 20px; overflow: auto; border: 1px solid #333; font-family: 'Courier New', Courier, monospace;}
+        .close-btn { position: absolute; top: 20px; right: 30px; font-size: 30px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <h1>File Explorer</h1>
+        <h2>Root: {{ home_dir }}</h2>
+        <a href="/download_zip"><button>Download All as ZIP</button></a>
+        <div id="file-list"></div>
+    </div>
+    <div class="main-content">
+        <div class="top-bar">
+            <h2>Live Console Log</h2>
+            <button id="copy-log">Copy Log</button>
+        </div>
+        <div class="log-container" id="log-content"></div>
+    </div>
+    <div class="file-viewer" id="file-viewer">
+        <span class="close-btn" onclick="closeFileViewer()">&times;</span>
+        <pre id="file-viewer-content" class="file-viewer-content"></pre>
+    </div>
+
+    <script>
+        // --- Live Log Streaming ---
+        const logContent = document.getElementById('log-content');
+        const eventSource = new EventSource('/log_stream');
+        eventSource.onmessage = function(event) {
+            logContent.innerHTML += event.data + '<br>';
+            logContent.scrollTop = logContent.scrollHeight;
+        };
+
+        // --- Copy Log Button ---
+        document.getElementById('copy-log').addEventListener('click', () => {
+            navigator.clipboard.writeText(logContent.innerText).then(() => {
+                alert('Log copied to clipboard!');
+            });
+        });
+
+        // --- File Browser ---
+        function loadFiles(path = '') {
+            fetch(`/files?path=${encodeURIComponent(path)}`)
+                .then(response => response.json())
+                .then(data => {
+                    const fileList = document.getElementById('file-list');
+                    fileList.innerHTML = '';
+                    if (path) {
+                        const parentPath = path.substring(0, path.lastIndexOf('/'));
+                        const upLink = document.createElement('a');
+                        upLink.href = '#';
+                        upLink.className = 'dir';
+                        upLink.textContent = '[..]';
+                        upLink.onclick = (e) => { e.preventDefault(); loadFiles(parentPath); };
+                        fileList.appendChild(document.createElement('li')).appendChild(upLink);
+                    }
+                    data.dirs.forEach(dir => {
+                        const li = document.createElement('li');
+                        const link = document.createElement('a');
+                        link.href = '#';
+                        link.className = 'dir';
+                        link.textContent = dir + '/';
+                        link.onclick = (e) => { e.preventDefault(); loadFiles(data.path + '/' + dir); };
+                        li.appendChild(link);
+                        fileList.appendChild(li);
+                    });
+                    data.files.forEach(file => {
+                        const li = document.createElement('li');
+                        const viewLink = document.createElement('a');
+                        viewLink.href = '#';
+                        viewLink.className = 'file';
+                        viewLink.textContent = file;
+                        viewLink.onclick = (e) => { e.preventDefault(); viewFile(data.path + '/' + file); };
+                        
+                        const downloadLink = document.createElement('a');
+                        downloadLink.href = `/download${data.path}/${file}`;
+                        downloadLink.textContent = ' (download)';
+                        downloadLink.style.fontSize = '0.8em';
+
+                        li.appendChild(viewLink);
+                        li.appendChild(downloadLink);
+                        fileList.appendChild(li);
+                    });
+                });
+        }
+        
+        let fileEventSource = null;
+
+        function viewFile(filePath) {
+            const viewer = document.getElementById('file-viewer');
+            const content = document.getElementById('file-viewer-content');
+            viewer.style.display = 'flex';
+            content.textContent = 'Loading...';
+
+            if (fileEventSource) {
+                fileEventSource.close();
+            }
+
+            fileEventSource = new EventSource(`/view${filePath}`);
+            let fullContent = '';
+            fileEventSource.onmessage = function(event) {
+                if (event.data === '___EOF___') {
+                    fileEventSource.close();
+                    return;
+                }
+                fullContent += event.data + '\\n';
+                content.textContent = fullContent;
+            };
+        }
+
+        function closeFileViewer() {
+            if (fileEventSource) {
+                fileEventSource.close();
+            }
+            document.getElementById('file-viewer').style.display = 'none';
+        }
+
+        document.addEventListener('DOMContentLoaded', () => loadFiles());
+    </script>
+</body>
+</html>
+"""
+
+# --- Flask Routes ---
+@flask_app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, home_dir=HOME_DIR)
+
+@flask_app.route('/log_stream')
+def log_stream():
+    def generate():
+        with open(os.path.join(LOGS_DIR, "console.log"), 'r', encoding='utf-8') as f:
+            f.seek(0, 2) # Go to the end of the file
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                yield f"data: {line.strip()}\n\n"
+    return Response(generate(), mimetype='text/event-stream')
+    
+@flask_app.route('/files')
+def list_files():
+    req_path = request.args.get('path', '')
+    base_path = os.path.join(HOME_DIR, req_path.strip('/'))
+    
+    # Security check to prevent directory traversal
+    if not os.path.abspath(base_path).startswith(os.path.abspath(HOME_DIR)):
+        return jsonify({"error": "Access denied"}), 403
+
+    dirs = []
+    files = []
+    try:
+        if os.path.isdir(base_path):
+            for item in os.listdir(base_path):
+                if os.path.isdir(os.path.join(base_path, item)):
+                    dirs.append(item)
+                else:
+                    files.append(item)
+    except FileNotFoundError:
+        return jsonify({"error": "Directory not found"}), 404
+        
+    return jsonify({"path": req_path, "dirs": sorted(dirs), "files": sorted(files)})
+
+@flask_app.route('/view<path:filepath>')
+def view_file(filepath):
+    abs_path = os.path.join(HOME_DIR, filepath.strip('/'))
+    if not os.path.abspath(abs_path).startswith(os.path.abspath(HOME_DIR)):
+        return "Access Denied", 403
+
+    def generate():
+        try:
+            with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                while True:
+                    line = f.readline()
+                    if not line:
+                        yield 'data: ___EOF___\n\n' # End of file signal
+                        break
+                    yield f'data: {line.rstrip()}\\n\\n'
+        except Exception as e:
+            yield f'data: Error reading file: {str(e)}\\n\\n'
+            yield 'data: ___EOF___\n\n'
+
+    return Response(generate(), mimetype='text/event-stream')
+
+@flask_app.route('/download<path:filepath>')
+def download_file(filepath):
+    return send_from_directory(HOME_DIR, filepath, as_attachment=True)
+    
+@flask_app.route('/download_zip')
+def download_zip():
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(HOME_DIR):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, HOME_DIR)
+                zf.write(file_path, arcname)
+    memory_file.seek(0)
+    return send_file(memory_file, download_name='home_dir_archive.zip', as_attachment=True)
+
+def run_flask():
+    root_logger.info("Starting Flask web server...")
+    flask_app.run(host='0.0.0.0', port=5000)
+
+# ==============================================================================
+# SCRIPT EXECUTION
+# ==============================================================================
 if __name__ == "__main__":
     try:
-        main()
+        # Run Flask in a separate thread
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+
+        # Run the bot in the main thread
+        run_bot()
     except Exception as e:
-        root_logger.critical(f"Bot failed to start or crashed: {e}", exc_info=True)
+        root_logger.critical(f"Application failed to start or crashed: {e}", exc_info=True)
