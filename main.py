@@ -22,7 +22,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FLASK_PASSWORD = os.getenv("FLASK_PASSWORD")
 WEB_REQUEST_URL = os.getenv("WEB_REQUEST_URL")
 
-MODEL_NAME = "gemini-1.5-flash" # Changed to a more recent model, but you can use your preferred one
+MODEL_NAME = "gemini-1.5-flash"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY or not FLASK_PASSWORD:
     print("FATAL ERROR: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, and FLASK_PASSWORD must be set in the .env file.")
@@ -108,7 +108,7 @@ try:
 7. Multiline code block → ```\ncode here\n```
 8. [Inline link](https://example.com) → `[text](https://example.com)`
 9. Mention user → `[Name](tg://user?id=USER_ID)`
-10. Escape reserved characters with `\` before these: 
+10. Escape reserved characters with `\` before these:
    `_ * [ ] ( ) ~ ` > # + - = | { } . !`
 
 ⚡ Example:
@@ -119,7 +119,6 @@ try:
         MODEL_NAME,
         system_instruction=system_instruction
     )
-    history = deque(maxlen=20)
     root_logger.info(f"Gemini AI client configured successfully with model: {MODEL_NAME}")
 except Exception as e:
     root_logger.critical(f"Failed to configure Gemini AI: {e}", exc_info=True)
@@ -133,43 +132,65 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # -----------------------------
-# Bot State Management
+# Bot State Management (Reply Modes)
 # -----------------------------
 chat_reply_modes = {}
 
 # -----------------------------
 # Gemini & Telegram Interaction Helpers
 # -----------------------------
-def generate_gemini_answer(prompt: str) -> str:
-    history.append({'role': 'user', 'parts': [prompt]})
+def generate_gemini_answer(prompt: str, chat_history: deque) -> str:
+    """
+    Generates an answer using Gemini, maintaining a specific chat's history.
+    """
+    chat_history.append({'role': 'user', 'parts': [prompt]})
     try:
-        chat_session = gemini_model.start_chat(history=list(history))
+        # Pass the history from the deque to the model
+        chat_session = gemini_model.start_chat(history=list(chat_history))
         response = chat_session.send_message(prompt)
         full_response_text = response.text
 
         if full_response_text.strip():
-            history.append({'role': 'model', 'parts': [full_response_text]})
+            # Add the model's response back to the history deque
+            chat_history.append({'role': 'model', 'parts': [full_response_text]})
 
-        if len(history) > 10:
-            history.popleft()
-            history.popleft()
         return full_response_text
 
     except exceptions.GoogleAPICallError as e:
         root_logger.error(f"Gemini API Call Error: {e}")
+        # Remove the user's prompt from history if the API call failed
+        chat_history.pop()
         return "API Error: Could not get a response."
     except Exception as e:
         root_logger.error(f"Unexpected error in Gemini generation: {e}", exc_info=True)
+        # Remove the user's prompt from history if an unknown error occurred
+        chat_history.pop()
         return "An unexpected error occurred."
 
 async def generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    """
+    Handles the full process of getting a chat's history, generating a response,
+    cleaning it, and replying.
+    """
+    # Get or create a conversation history for the specific chat
+    if 'history' not in context.chat_data:
+        context.chat_data['history'] = deque(maxlen=20)
+    chat_history = context.chat_data['history']
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    answer = await asyncio.to_thread(generate_gemini_answer, prompt)
+
+    # Generate the answer using the specific chat's history
+    raw_answer = await asyncio.to_thread(generate_gemini_answer, prompt, chat_history)
+
+    # **FIX:** Clean the model's output to remove unwanted backslashes
+    answer = raw_answer.replace('\\\n', '\n').strip()
+
     await update.message.reply_text(answer, parse_mode="MarkdownV2")
     user_logger = get_user_logger(update.message.chat.id, update.message.from_user.full_name)
     user_logger.info(f"BOT: {' '.join(answer.splitlines())}")
 
 def log_user_message(func):
+    """Decorator to log incoming user messages."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text: return
         user = update.message.from_user
@@ -294,13 +315,20 @@ def run_bot():
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     root_logger.info("Bot is running and polling for updates.")
+    
+    # NOTE ON `telegram.error.Conflict`:
+    # This error means another instance of your bot is running with the same token.
+    # On hosting platforms like Render, this can happen if a new deployment starts
+    # before the old one has completely shut down.
+    # SOLUTION: Ensure your hosting service is configured to run ONLY ONE instance
+    # of this script at a time. Check your service's dashboard and logs.
     app.run_polling()
 
 # ==============================================================================
 # FLASK WEBSERVER
 # ==============================================================================
 flask_app = Flask(__name__)
-flask_app.secret_key = os.urandom(24) 
+flask_app.secret_key = os.urandom(24)
 HOME_DIR = os.getcwd()
 
 # --- Web Request Function ---
@@ -494,7 +522,7 @@ HTML_TEMPLATE = """
                     fileEventSource.close();
                     return;
                 }
-                fullContent += event.data + '\\n'; // Use a real newline
+                fullContent += event.data + '\\n';
                 content.textContent = fullContent;
             };
             fileEventSource.onerror = function() {
@@ -521,7 +549,7 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not session.get('logged_in'):
-            if request.path.startswith('/files') or request.path.startswith('/log_stream') or request.path.startswith('/view'):
+            if request.path.startswith(('/files', '/log_stream', '/view')):
                  return jsonify({"error": "Not authenticated"}), 401
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
@@ -658,8 +686,6 @@ def download_zip():
 
 def run_flask():
     root_logger.info("Starting Flask web server...")
-    # NOTE FOR LINUX: Ports below 1024 require root privileges.
-    # Using a port like 8080 is recommended to avoid running the script as root.
     flask_app.run(host='0.0.0.0', port=8080, use_reloader=False)
 
 
