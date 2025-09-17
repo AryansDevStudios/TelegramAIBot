@@ -96,7 +96,7 @@ try:
 - Use bullet points, examples, and emojis.
 - One or two lines unless a longer answer is explicitly needed.
 - Never use LaTeX or unsupported markup.
-- Escape reserved characters when needed to avoid formatting errors.
+- Escape reserved characters to avoid formatting errors.
 
 📖 Telegram MarkdownV2 Formatting Guide:
 1. *Bold* → `*bold*`
@@ -104,16 +104,17 @@ try:
 3. __Underline__ → `__underline__`
 4. ~Strikethrough~ → `~strikethrough~`
 5. ||Spoiler|| → `||hidden text||`
-6. `Inline code` → `` `code` ``
+6. Inline code → `` `code` ``
 7. Multiline code block → ```\ncode here\n```
 8. [Inline link](https://example.com) → `[text](https://example.com)`
 9. Mention user → `[Name](tg://user?id=USER_ID)`
-10. Escape reserved characters with `\` before these:
-   `_ * [ ] ( ) ~ ` > # + - = | { } . !`
+10. Escape reserved characters with a backslash `\` before these:
+    `_ * [ ] ( ) ~ ` > # + - = | { } . !`
 
 ⚡ Example:
-"Hello *world*\! Visit [Google](https://google.com) for more info\."
+Hello \*world\*! Visit [Google](https://google.com) for more info\.
 """
+
 
     gemini_model = genai.GenerativeModel(
         MODEL_NAME,
@@ -130,6 +131,7 @@ except Exception as e:
 from telegram import Update
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import BadRequest
 
 # -----------------------------
 # Bot State Management (Reply Modes)
@@ -169,25 +171,33 @@ def generate_gemini_answer(prompt: str, chat_history: deque) -> str:
 
 async def generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     """
-    Handles the full process of getting a chat's history, generating a response,
-    cleaning it, and replying.
+    Handles getting a response from Gemini and sending it, with a safety net for MarkdownV2 escaping.
     """
-    # Get or create a conversation history for the specific chat
     if 'history' not in context.chat_data:
         context.chat_data['history'] = deque(maxlen=20)
     chat_history = context.chat_data['history']
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # Generate the answer using the specific chat's history
     raw_answer = await asyncio.to_thread(generate_gemini_answer, prompt, chat_history)
+    
+    # ** THE FIX IS HERE **
+    # Safety net: The model should handle escaping, but we apply a regex to catch common mistakes
+    # (like unescaped '!', '.', '-', etc.) without breaking intentional formatting like *bold*.
+    # A negative lookbehind `(?<!\\)` ensures we don't double-escape.
+    safe_answer = re.sub(r'(?<!\\)([.!+(){}-])', r'\\\1', raw_answer.strip())
 
-    # **FIX:** Clean the model's output to remove unwanted backslashes
-    answer = raw_answer.replace('\\\n', '\n').strip()
+    try:
+        await update.message.reply_text(safe_answer, parse_mode="MarkdownV2")
+    except BadRequest as e:
+        # If the safety net fails, log the error and send a clean fallback message.
+        root_logger.error(f"MarkdownV2 parsing failed despite safety net: {e}. Original text from model: {raw_answer.strip()}")
+        await update.message.reply_text("There was a formatting error in the response\\. Please try again\\.")
 
-    await update.message.reply_text(answer, parse_mode="MarkdownV2")
+    # Log the bot's reply
     user_logger = get_user_logger(update.message.chat.id, update.message.from_user.full_name)
-    user_logger.info(f"BOT: {' '.join(answer.splitlines())}")
+    user_logger.info(f"BOT: {' '.join(safe_answer.splitlines())}")
+
 
 def log_user_message(func):
     """Decorator to log incoming user messages."""
@@ -205,7 +215,11 @@ def log_user_message(func):
 # -----------------------------
 @log_user_message
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Hello! I’m your study group bot. Ask me anything!")
+    # Static messages must also be properly escaped for MarkdownV2.
+    await update.message.reply_text(
+        "🤖 Hello\\! I’m your study group bot\\. Ask me anything\\!",
+        parse_mode='MarkdownV2'
+    )
 
 @log_user_message
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,7 +244,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = " ".join(context.args)
     if not question:
-        await update.message.reply_text("Please provide a question after /ask.")
+        await update.message.reply_text("Please provide a question after `/ask`\\.", parse_mode='MarkdownV2')
         return
     await generate_and_reply(update, context, question)
 
@@ -238,25 +252,25 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("This command is only for group chats.")
+        await update.message.reply_text("This command is only for group chats\\.", parse_mode='MarkdownV2')
         return
     if not context.args:
         current_mode = "mention/reply" if chat_reply_modes.get(chat.id, False) else "all messages"
         await update.message.reply_text(
-            f"Current reply mode: *{current_mode}*.\n\n"
-            "Usage: `/replymode true` (only reply on mention) or `/replymode false` (reply to all messages).",
+            f"Current reply mode: *{current_mode}*\\.\n\n"
+            "Usage: `/replymode true` \\(only reply on mention\\) or `/replymode false` \\(reply to all messages\\)\\.",
             parse_mode='MarkdownV2'
         )
         return
     new_mode_str = context.args[0].lower()
     if new_mode_str in ["true", "on", "yes"]:
         chat_reply_modes[chat.id] = True
-        await update.message.reply_text("✅ Bot will now only reply when mentioned or replied to.")
+        await update.message.reply_text("✅ Bot will now only reply when mentioned or replied to\\.", parse_mode='MarkdownV2')
     elif new_mode_str in ["false", "off", "no"]:
         chat_reply_modes[chat.id] = False
-        await update.message.reply_text("📢 Bot will now reply to all messages in the group.")
+        await update.message.reply_text("📢 Bot will now reply to all messages in the group\\.", parse_mode='MarkdownV2')
     else:
-        await update.message.reply_text("Invalid option. Please use `true` or `false`.")
+        await update.message.reply_text("Invalid option\\. Please use `true` or `false`\\.", parse_mode='MarkdownV2')
 
 @log_user_message
 async def tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,23 +296,26 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "Here's what I can do:\n\n"
-        "💬 Just chat with me directly with any question!\n\n"
-        "Or use these commands:\n"
-        "/start - Greeting message\n"
-        "/ask <question> - Ask a specific question\n"
-        "/tip - Get a study tip\n"
-        "/example - See an example question\n"
-        "/quiz - Get a mini quiz question\n"
-        "/rules - Show group study rules\n"
-        "/funfact - Get a fun fact\n\n"
+        "💬 Just chat with me directly with any question\\!\n\n"
+        "*Or use these commands:*\n"
+        "`/start` \\- Greeting message\n"
+        "`/ask <question>` \\- Ask a specific question\n"
+        "`/tip` \\- Get a study tip\n"
+        "`/example` \\- See an example question\n"
+        "`/quiz` \\- Get a mini quiz question\n"
+        "`/rules` \\- Show group study rules\n"
+        "`/funfact` \\- Get a fun fact\n\n"
         "🛠️ *Group Commands*:\n"
-        "/replymode <true/false> - Set when I reply in groups"
+        "`/replymode <true/false>` \\- Set when I reply in groups"
     )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text, parse_mode='MarkdownV2')
 
 @log_user_message
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("I am a study group assistant bot powered by Google's Gemini AI.")
+    await update.message.reply_text(
+        "I am a study group assistant bot powered by Google's Gemini AI\\.",
+        parse_mode='MarkdownV2'
+    )
 
 # -----------------------------
 # Main Bot Setup
@@ -315,17 +332,10 @@ def run_bot():
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     root_logger.info("Bot is running and polling for updates.")
-    
-    # NOTE ON `telegram.error.Conflict`:
-    # This error means another instance of your bot is running with the same token.
-    # On hosting platforms like Render, this can happen if a new deployment starts
-    # before the old one has completely shut down.
-    # SOLUTION: Ensure your hosting service is configured to run ONLY ONE instance
-    # of this script at a time. Check your service's dashboard and logs.
     app.run_polling()
 
 # ==============================================================================
-# FLASK WEBSERVER
+# FLASK WEBSERVER (No changes below this line)
 # ==============================================================================
 flask_app = Flask(__name__)
 flask_app.secret_key = os.urandom(24)
@@ -339,7 +349,7 @@ def send_keep_alive_request():
         return
 
     try:
-        response = requests.get(WEB_REQUEST_URL, timeout=10)
+        response = requests.get(WEB_REQUEST_URL, timeout=20)
         web_request_logger.info(
             f"Sent request to {WEB_REQUEST_URL}. Status: {response.status_code}. Response: {response.text[:100]}"
         )
@@ -393,10 +403,12 @@ HTML_TEMPLATE = """
         .main-content { flex-grow: 1; display: flex; flex-direction: column; }
         .log-container { flex-grow: 1; background-color: #181818; padding: 20px; overflow-y: auto; font-family: 'Courier New', Courier, monospace; font-size: 14px; white-space: pre-wrap; }
         .top-bar { padding: 10px 20px; background-color: #1e1e1e; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+        .top-bar-controls { display: flex; gap: 10px; }
         h1, h2 { color: #ffffff; border-bottom: 1px solid #444; padding-bottom: 10px; }
         h1 { margin-top: 0; }
         button { background-color: #333; color: #fff; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; transition: background-color 0.2s; margin-bottom: 15px; }
         button:hover { background-color: #555; }
+        .top-bar button { margin-bottom: 0; }
         .logout-btn { background-color: #cf6679; margin-top: auto; }
         .logout-btn:hover { background-color: #b05260; }
         ul { list-style: none; padding: 0; }
@@ -423,7 +435,11 @@ HTML_TEMPLATE = """
     <div class="main-content">
         <div class="top-bar">
             <h2>Live Console Log</h2>
-            <button id="copy-log">Copy Log</button>
+            <!-- MODIFICATION: Added a container for the buttons -->
+            <div class="top-bar-controls">
+                <button id="clear-log">Clear Console</button>
+                <button id="copy-log">Copy Log</button>
+            </div>
         </div>
         <div class="log-container" id="log-content"></div>
     </div>
@@ -433,8 +449,9 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        // --- Live Log Streaming ---
         const logContent = document.getElementById('log-content');
+        
+        // --- Live Log Streaming ---
         const eventSource = new EventSource('/log_stream');
         eventSource.onmessage = function(event) {
             logContent.innerHTML += event.data + '<br>';
@@ -446,6 +463,11 @@ HTML_TEMPLATE = """
             navigator.clipboard.writeText(logContent.innerText).then(() => {
                 alert('Log copied to clipboard!');
             });
+        });
+
+        // --- MODIFICATION: Added Clear Log Button ---
+        document.getElementById('clear-log').addEventListener('click', () => {
+            logContent.innerHTML = '';
         });
 
         // --- File Browser ---
@@ -517,16 +539,14 @@ HTML_TEMPLATE = """
 
             fileEventSource = new EventSource(`/view/${filePath}`);
             let fullContent = '';
+            // MODIFICATION: Simplified logic for a continuous stream
             fileEventSource.onmessage = function(event) {
-                if (event.data === '___EOF___') {
-                    fileEventSource.close();
-                    return;
-                }
                 fullContent += event.data + '\\n';
                 content.textContent = fullContent;
+                content.scrollTop = content.scrollHeight; // Auto-scroll
             };
             fileEventSource.onerror = function() {
-                content.textContent = 'Error loading file. It may be binary or unreadable.';
+                content.textContent += '\\n--- End of stream or error ---';
                 fileEventSource.close();
             }
         }
@@ -590,18 +610,20 @@ def log_stream():
     def generate():
         try:
             with open(log_file_path, 'r', encoding='utf-8') as f:
+                # First, send the last N lines of the file
                 initial_lines = deque(f, maxlen=INITIAL_LOG_LINES)
                 for line in initial_lines:
-                    yield f"data: {line.strip()}\\n\\n"
+                    yield f"data: {line.strip()}\n\n"
                 
+                # Then, "tail" the file for new lines
                 while True:
                     line = f.readline()
                     if not line:
-                        time.sleep(0.1)
+                        time.sleep(0.1) # Wait for new content
                         continue
-                    yield f"data: {line.strip()}\\n\\n"
+                    yield f"data: {line.strip()}\n\n"
         except FileNotFoundError:
-             yield f"data: ERROR: Log file not found at {log_file_path}\\n\\n"
+             yield f"data: ERROR: Log file not found at {log_file_path}\n\n"
 
     return Response(generate(), mimetype='text/event-stream')
     
@@ -635,18 +657,23 @@ def view_file(filepath):
     if not os.path.abspath(abs_path).startswith(os.path.abspath(HOME_DIR)):
         return "Access Denied", 403
 
+    # MODIFICATION: This function now continuously tails the file
     def generate():
         try:
             with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                # First, stream all existing content
+                for line in f:
+                    yield f'data: {line.rstrip()}\n\n'
+                
+                # Then, tail the file for new lines
                 while True:
                     line = f.readline()
                     if not line:
-                        yield 'data: ___EOF___\n\n'
-                        break
+                        time.sleep(0.1)
+                        continue
                     yield f'data: {line.rstrip()}\n\n'
         except Exception as e:
             yield f'data: Error reading file: {str(e)}\n\n'
-            yield 'data: ___EOF___\n\n'
 
     return Response(generate(), mimetype='text/event-stream')
 
@@ -686,17 +713,43 @@ def download_zip():
 
 def run_flask():
     root_logger.info("Starting Flask web server...")
-    flask_app.run(host='0.0.0.0', port=8080, use_reloader=False)
+    # MODIFICATION: Added threaded=True to handle concurrent requests
+    flask_app.run(host='0.0.0.0', port=8080, use_reloader=False, threaded=True)
 
+
+# ==============================================================================
+# FLASK WEBSERVER (No changes below this line)
+# ==============================================================================
+
+# ... (keep all your existing Flask code here) ...
+
+def run_flask():
+    root_logger.info("Starting Flask web server...")
+    flask_app.run(host='0.0.0.0', port=8080, use_reloader=False, threaded=True)
+
+def periodic_web_request():
+    """Runs a keep-alive request every 60 seconds."""
+    while True:
+        send_keep_alive_request()
+        time.sleep(60) # Wait for 60 seconds
 
 # ==============================================================================
 # SCRIPT EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
     try:
+        # Start the Flask app in its own thread
         flask_thread = threading.Thread(target=run_flask)
         flask_thread.daemon = True
         flask_thread.start()
+
+        # ++ ADD THIS LINE TO START THE PERIODIC REQUEST ++
+        # Start the periodic web request in its own thread
+        web_request_thread = threading.Thread(target=periodic_web_request)
+        web_request_thread.daemon = True
+        web_request_thread.start()
+
+        # Start the bot (this will block the main thread)
         run_bot()
     except Exception as e:
         root_logger.critical(f"Application failed to start or crashed: {e}", exc_info=True)
