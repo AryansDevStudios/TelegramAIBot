@@ -12,6 +12,8 @@ from flask import Flask, render_template_string, Response, jsonify, send_from_di
 from functools import wraps
 import zipfile
 import io
+# NEW: Added import for making web requests
+import requests
 
 # -----------------------------
 # Load Environment Variables & Configuration
@@ -19,11 +21,16 @@ import io
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# NEW: Load password and URL from environment variables
+FLASK_PASSWORD = os.getenv("FLASK_PASSWORD")
+WEB_REQUEST_URL = os.getenv("WEB_REQUEST_URL")
 
-MODEL_NAME = "gemini-2.5-flash"
 
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("FATAL ERROR: TELEGRAM_BOT_TOKEN and GEMINI_API_KEY must be set in the .env file.")
+MODEL_NAME = "gemini-2.5-flash-lite"
+
+# MODIFIED: Added check for the new FLASK_PASSWORD variable
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY or not FLASK_PASSWORD:
+    print("FATAL ERROR: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, and FLASK_PASSWORD must be set in the .env file.")
     exit()
 
 # -----------------------------
@@ -48,6 +55,19 @@ root_logger.addHandler(console_handler)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING) # NEW: Quieter logs for the requests library
+
+# NEW: Separate logger for web requests
+web_request_logger = logging.getLogger('WebRequestLogger')
+web_request_logger.setLevel(logging.INFO)
+web_request_logger.propagate = False # Prevent web logs from appearing in the main console.log
+web_request_handler = RotatingFileHandler(
+    os.path.join(LOGS_DIR, "webrequests.log"), maxBytes=1*1024*1024, backupCount=3, encoding="utf-8"
+)
+web_request_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+web_request_logger.addHandler(web_request_handler)
+# --- End of new logger setup
+
 user_loggers = {}
 
 def sanitize_filename(name: str) -> str:
@@ -270,9 +290,23 @@ def run_bot():
 # FLASK WEBSERVER
 # ==============================================================================
 flask_app = Flask(__name__)
-# ADDED: Secret key for session management
 flask_app.secret_key = os.urandom(24) 
 HOME_DIR = os.getcwd()
+
+# --- NEW: Web Request Function ---
+def send_keep_alive_request():
+    """Sends a GET request to the specified URL and logs the result separately."""
+    if not WEB_REQUEST_URL:
+        web_request_logger.warning("WEB_REQUEST_URL is not set. Skipping request.")
+        return
+
+    try:
+        response = requests.get(WEB_REQUEST_URL, timeout=10)
+        web_request_logger.info(
+            f"Sent request to {WEB_REQUEST_URL}. Status: {response.status_code}. Response: {response.text[:100]}"
+        )
+    except requests.exceptions.RequestException as e:
+        web_request_logger.error(f"Failed to send request to {WEB_REQUEST_URL}. Error: {e}")
 
 # --- NEW: Login Template ---
 LOGIN_TEMPLATE = """
@@ -471,9 +505,8 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not session.get('logged_in'):
-            # For API-like endpoints, return an error or redirect
             if request.path.startswith('/files') or request.path.startswith('/log_stream'):
-                return redirect(url_for('login')) # Redirecting is simpler for JS fetch
+                return redirect(url_for('login'))
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
@@ -483,11 +516,10 @@ def login_required(f):
 def login():
     error = None
     if request.method == 'POST':
-        # The password is 'skyisblue2010'
-        if request.form.get('password') == 'skyisblue2010':
+        # MODIFIED: Use password from environment variable
+        if request.form.get('password') == FLASK_PASSWORD:
             session['logged_in'] = True
             root_logger.info("Successful login to web panel.")
-            # Redirect to the main page after successful login
             return redirect(url_for('index'))
         else:
             error = 'Invalid password. Please try again.'
@@ -502,6 +534,8 @@ def logout():
 @flask_app.route('/')
 @login_required
 def index():
+    # NEW: Send the keep-alive request in a non-blocking thread when the page is loaded
+    threading.Thread(target=send_keep_alive_request).start()
     return render_template_string(HTML_TEMPLATE, home_dir=HOME_DIR)
 
 @flask_app.route('/log_stream')
@@ -593,7 +627,10 @@ def download_zip():
 
 def run_flask():
     root_logger.info("Starting Flask web server...")
-    flask_app.run(host='0.0.0.0', port=80)
+    # MODIFIED: It's generally better practice not to use the reloader in production-like scripts.
+    # It can cause the script to run twice. Let's run it directly.
+    flask_app.run(host='0.0.0.0', port=80, use_reloader=False)
+
 
 # ==============================================================================
 # SCRIPT EXECUTION
