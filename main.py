@@ -22,7 +22,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FLASK_PASSWORD = os.getenv("FLASK_PASSWORD")
 WEB_REQUEST_URL = os.getenv("WEB_REQUEST_URL")
 
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY or not FLASK_PASSWORD:
     print("FATAL ERROR: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, and FLASK_PASSWORD must be set in the .env file.")
