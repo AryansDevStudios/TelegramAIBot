@@ -7,7 +7,9 @@ from collections import deque
 from dotenv import load_dotenv
 import threading
 import time
-from flask import Flask, render_template_string, Response, jsonify, send_from_directory, send_file
+# FIXED: Added imports for login functionality
+from flask import Flask, render_template_string, Response, jsonify, send_from_directory, send_file, request, redirect, url_for, session
+from functools import wraps
 import zipfile
 import io
 
@@ -18,7 +20,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MODEL_NAME = "gemini-1.5-flash"  # Changed to a generally available model
+MODEL_NAME = "gemini-2.5-flash"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     print("FATAL ERROR: TELEGRAM_BOT_TOKEN and GEMINI_API_KEY must be set in the .env file.")
@@ -45,7 +47,7 @@ root_logger.addHandler(console_handler)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("werkzeug").setLevel(logging.WARNING) # Quieten Flask's default logger
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 user_loggers = {}
 
 def sanitize_filename(name: str) -> str:
@@ -181,7 +183,6 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await generate_and_reply(update, context, question)
 
-# ... (other bot command handlers: set_reply_mode, tip, example, etc.) ...
 @log_user_message
 async def set_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -269,9 +270,44 @@ def run_bot():
 # FLASK WEBSERVER
 # ==============================================================================
 flask_app = Flask(__name__)
-HOME_DIR = "/home/AryanIssPro/"
+# ADDED: Secret key for session management
+flask_app.secret_key = os.urandom(24) 
+HOME_DIR = os.getcwd()
 
-# --- HTML & JS TEMPLATE ---
+# --- NEW: Login Template ---
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Login</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto; background-color: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-container { background-color: #1e1e1e; padding: 40px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); text-align: center; }
+        h1 { color: #fff; }
+        input[type="password"] { width: 80%; padding: 10px; margin-top: 20px; border-radius: 5px; border: 1px solid #333; background-color: #222; color: #fff; }
+        button { background-color: #bb86fc; color: #121212; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; transition: background-color 0.2s; margin-top: 20px; font-weight: bold; }
+        button:hover { background-color: #a063f0; }
+        .error { color: #cf6679; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>Control Panel Access</h1>
+        <form method="post">
+            <input type="password" name="password" placeholder="Password" required>
+            <br>
+            <button type="submit">Login</button>
+        </form>
+        {% if error %}
+            <p class="error">{{ error }}</p>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+# --- HTML & JS TEMPLATE (Main Panel) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -281,14 +317,16 @@ HTML_TEMPLATE = """
     <title>Bot Control Panel</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #121212; color: #e0e0e0; display: flex; height: 100vh; }
-        .sidebar { width: 300px; background-color: #1e1e1e; padding: 20px; border-right: 1px solid #333; overflow-y: auto; }
+        .sidebar { width: 300px; background-color: #1e1e1e; padding: 20px; border-right: 1px solid #333; overflow-y: auto; display: flex; flex-direction: column; }
         .main-content { flex-grow: 1; display: flex; flex-direction: column; }
         .log-container { flex-grow: 1; background-color: #181818; padding: 20px; overflow-y: auto; font-family: 'Courier New', Courier, monospace; font-size: 14px; white-space: pre-wrap; }
         .top-bar { padding: 10px 20px; background-color: #1e1e1e; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
         h1, h2 { color: #ffffff; border-bottom: 1px solid #444; padding-bottom: 10px; }
         h1 { margin-top: 0; }
-        button { background-color: #333; color: #fff; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; transition: background-color 0.2s; }
+        button { background-color: #333; color: #fff; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; transition: background-color 0.2s; margin-bottom: 15px; }
         button:hover { background-color: #555; }
+        .logout-btn { background-color: #cf6679; margin-top: auto; } /* Style for logout */
+        .logout-btn:hover { background-color: #b05260; }
         ul { list-style: none; padding: 0; }
         li { margin: 5px 0; }
         a { color: #bb86fc; text-decoration: none; }
@@ -302,10 +340,13 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="sidebar">
-        <h1>File Explorer</h1>
-        <h2>Root: {{ home_dir }}</h2>
-        <a href="/download_zip"><button>Download All as ZIP</button></a>
-        <div id="file-list"></div>
+        <div>
+            <h1>File Explorer</h1>
+            <h2>Root: {{ home_dir }}</h2>
+            <a href="/download_zip"><button>Download All as ZIP</button></a>
+            <div id="file-list"></div>
+        </div>
+        <a href="/logout"><button class="logout-btn">Logout</button></a>
     </div>
     <div class="main-content">
         <div class="top-bar">
@@ -338,8 +379,15 @@ HTML_TEMPLATE = """
         // --- File Browser ---
         function loadFiles(path = '') {
             fetch(`/files?path=${encodeURIComponent(path)}`)
-                .then(response => response.json())
+                .then(response => {
+                    if (response.redirected) {
+                        window.location.href = response.url;
+                        return;
+                    }
+                    return response.json();
+                })
                 .then(data => {
+                    if (!data) return;
                     const fileList = document.getElementById('file-list');
                     fileList.innerHTML = '';
                     if (path) {
@@ -418,30 +466,74 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# --- NEW: Login required decorator ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            # For API-like endpoints, return an error or redirect
+            if request.path.startswith('/files') or request.path.startswith('/log_stream'):
+                return redirect(url_for('login')) # Redirecting is simpler for JS fetch
+            return redirect(url_for('login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
 # --- Flask Routes ---
+@flask_app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        # The password is 'skyisblue2010'
+        if request.form.get('password') == 'skyisblue2010':
+            session['logged_in'] = True
+            root_logger.info("Successful login to web panel.")
+            # Redirect to the main page after successful login
+            return redirect(url_for('index'))
+        else:
+            error = 'Invalid password. Please try again.'
+            root_logger.warning("Failed login attempt to web panel.")
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+@flask_app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
 @flask_app.route('/')
+@login_required
 def index():
     return render_template_string(HTML_TEMPLATE, home_dir=HOME_DIR)
 
 @flask_app.route('/log_stream')
+@login_required
 def log_stream():
+    log_file_path = os.path.join(LOGS_DIR, "console.log")
+    INITIAL_LOG_LINES = 500
+
     def generate():
-        with open(os.path.join(LOGS_DIR, "console.log"), 'r', encoding='utf-8') as f:
-            f.seek(0, 2) # Go to the end of the file
-            while True:
-                line = f.readline()
-                if not line:
-                    time.sleep(0.1)
-                    continue
-                yield f"data: {line.strip()}\n\n"
+        try:
+            with open(log_file_path, 'r', encoding='utf-8') as f:
+                initial_lines = deque(f, maxlen=INITIAL_LOG_LINES)
+                for line in initial_lines:
+                    yield f"data: {line.strip()}\n\n"
+                
+                while True:
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.1)
+                        continue
+                    yield f"data: {line.strip()}\n\n"
+        except FileNotFoundError:
+             yield f"data: ERROR: Log file not found at {log_file_path}\n\n"
+
     return Response(generate(), mimetype='text/event-stream')
     
 @flask_app.route('/files')
+@login_required
 def list_files():
     req_path = request.args.get('path', '')
     base_path = os.path.join(HOME_DIR, req_path.strip('/'))
     
-    # Security check to prevent directory traversal
     if not os.path.abspath(base_path).startswith(os.path.abspath(HOME_DIR)):
         return jsonify({"error": "Access denied"}), 403
 
@@ -460,6 +552,7 @@ def list_files():
     return jsonify({"path": req_path, "dirs": sorted(dirs), "files": sorted(files)})
 
 @flask_app.route('/view<path:filepath>')
+@login_required
 def view_file(filepath):
     abs_path = os.path.join(HOME_DIR, filepath.strip('/'))
     if not os.path.abspath(abs_path).startswith(os.path.abspath(HOME_DIR)):
@@ -471,7 +564,7 @@ def view_file(filepath):
                 while True:
                     line = f.readline()
                     if not line:
-                        yield 'data: ___EOF___\n\n' # End of file signal
+                        yield 'data: ___EOF___\n\n'
                         break
                     yield f'data: {line.rstrip()}\\n\\n'
         except Exception as e:
@@ -481,10 +574,12 @@ def view_file(filepath):
     return Response(generate(), mimetype='text/event-stream')
 
 @flask_app.route('/download<path:filepath>')
+@login_required
 def download_file(filepath):
     return send_from_directory(HOME_DIR, filepath, as_attachment=True)
     
 @flask_app.route('/download_zip')
+@login_required
 def download_zip():
     memory_file = io.BytesIO()
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -494,23 +589,20 @@ def download_zip():
                 arcname = os.path.relpath(file_path, HOME_DIR)
                 zf.write(file_path, arcname)
     memory_file.seek(0)
-    return send_file(memory_file, download_name='home_dir_archive.zip', as_attachment=True)
+    return send_file(memory_file, download_name='project_archive.zip', as_attachment=True)
 
 def run_flask():
     root_logger.info("Starting Flask web server...")
-    flask_app.run(host='0.0.0.0', port=5000)
+    flask_app.run(host='0.0.0.0', port=80)
 
 # ==============================================================================
 # SCRIPT EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
     try:
-        # Run Flask in a separate thread
         flask_thread = threading.Thread(target=run_flask)
         flask_thread.daemon = True
         flask_thread.start()
-
-        # Run the bot in the main thread
         run_bot()
     except Exception as e:
         root_logger.critical(f"Application failed to start or crashed: {e}", exc_info=True)
