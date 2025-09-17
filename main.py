@@ -214,7 +214,7 @@ def log_user_message(func):
 # -----------------------------
 @log_user_message
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Static messages must also be properly escaped for MarkdownV2.
+    # Static messages must also be properly escaped for MarkdownV2...
     await update.message.reply_text(
         "🤖 Hello\\! I’m your study group bot\\. Ask me anything\\!",
         parse_mode='MarkdownV2'
