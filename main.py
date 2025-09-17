@@ -112,9 +112,8 @@ try:
     `_ * [ ] ( ) ~ ` > # + - = | { } . !`
 
 ⚡ Example:
-Hello \*world\*! Visit [Google](https://google.com) for more info\.
+Hello *world*! Visit [Google](https://google.com) for more info.
 """
-
 
     gemini_model = genai.GenerativeModel(
         MODEL_NAME,
